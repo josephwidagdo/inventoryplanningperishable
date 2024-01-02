@@ -1,0 +1,128 @@
+from pyomo.environ import *
+import csv
+import pandas as pd
+from datetime import datetime, timedelta
+
+model = AbstractModel()
+data = DataPortal()
+
+# Sets declaration + Data loading --------------------------------------------
+## Items
+item_shelf_life = pd.read_csv('item_shelf_life.csv', usecols = [0])
+model.ITEMS = Set(initialize=list(item_shelf_life['item_code']))
+## Days
+item_forecast = pd.read_csv('item_forecast.csv', usecols = [0])
+forecast_date = item_forecast['forecast_date']
+forecast_date_dt = pd.to_datetime(forecast_date)
+forecast_date_dt = list(set(forecast_date_dt))
+forecast_date_dt.append(min(forecast_date_dt)-timedelta(1))
+forecast_date_dt = sorted(forecast_date_dt)
+model.DAYS = Set(initialize=forecast_date_dt)
+
+# Parameters declaration + Data loading --------------------------------------
+## item_delivery_schedule
+item_delivery_schedule = pd.read_csv('item_delivery_schedule.csv')
+item_delivery_schedule['combined'] = item_delivery_schedule.drop('item_code',axis=1).values.tolist()
+item_delivery_schedule['unavailable_days'] = item_delivery_schedule['combined'].apply(lambda x: [i for i in range(len(x)) if x[i] == 'N'])
+def init_unavailable_days(model, item):
+    row = item_delivery_schedule[item_delivery_schedule['item_code']==item]
+    result = []
+    if not row.empty:
+        result = row['unavailable_days']
+    return list(result)[0]
+model.unavailable_days = Param(model.ITEMS, initialize=init_unavailable_days, default=[], within=Any)
+## qtydemand
+item_forecast = pd.read_csv('item_forecast.csv')
+item_forecast['forecast_date_dt']=pd.to_datetime(forecast_date)
+item_forecast['item_date']=item_forecast[['item_code','forecast_date_dt']].apply(tuple, axis=1)
+def init_qtydemand(model, item, date):
+    row = item_forecast[(item_forecast['item_code']==item) & (item_forecast['forecast_date_dt']==date)]
+    result = 0.0
+    if not row.empty:
+        result = row['forecast_quantity']
+    return float(result)
+model.qtydemand = Param(model.ITEMS, model.DAYS, initialize=init_qtydemand, default=0.0)
+## shelflife
+model.shelflife = Param(model.ITEMS, within=NonNegativeReals)
+data.load(filename='item_shelf_life.csv', param=model.shelflife,within=NonNegativeReals)
+# onhand_inventory
+model.onhand_inventory = Param(model.ITEMS, within=NonNegativeReals)
+data.load(filename='onhand_inventory.csv', select=('item_code','onhand_quantity'), param=model.onhand_inventory)
+# qty_unfulfilled_weight
+model.qty_unfulfilled_weight = Param(within=NonNegativeReals, initialize=10000)
+# wastage_weight
+model.wastage_weight = Param(within=NonNegativeReals, initialize=1)
+# min_order_qty
+model.min_order_qty = Param(within=NonNegativeReals, initialize=80)
+# max_order_qty
+model.max_order_qty = Param(within=NonNegativeReals, initialize=150)
+
+# Decision variables declaration ---------------------------------------------
+model.QtyOrder_Int = Var(model.ITEMS, model.DAYS, within=NonNegativeIntegers)
+model.QtyOrder = Var(model.ITEMS, model.DAYS, within=NonNegativeReals)
+
+# Helper variables declaration
+model.QtyUnfulfilled = Var(model.ITEMS, model.DAYS, within=NonNegativeReals)
+model.QtyWasted = Var(model.ITEMS, model.DAYS, within=NonNegativeReals)
+model.QtyFulfill = Var(model.ITEMS, model.DAYS, model.DAYS, within=NonNegativeReals)
+model.IsMakeOrder = Var(model.DAYS, within=Binary)
+
+# Objective function --------------------------------------------------------
+def objective_function(model):
+    return model.qty_unfulfilled_weight*sum(sum(model.QtyUnfulfilled[i,s] for s in model.DAYS) for i in model.ITEMS) + model.wastage_weight*sum(sum(model.QtyWasted[i,b] for b in model.DAYS) for i in model.ITEMS)
+model.objective = Objective(sense=minimize, rule=objective_function)
+
+# Constraints declaration ---------------------------------------------------
+# Constraint 1: Unfulfilled quantity
+def unfulfilled_quantity(model,i,s):
+    return sum(model.QtyFulfill[i,b,s] for b in model.DAYS if b >= s-timedelta(model.shelflife[i]) and b <= s) + model.QtyUnfulfilled[i,s] == model.qtydemand[i,s]
+
+# Constraint 2: Wastage
+def wastage(model,i,b):
+    return sum(model.QtyFulfill[i,b,s] for s in model.DAYS if s >= b and s <= b+timedelta(model.shelflife[i])) + model.QtyWasted[i,b] == model.QtyOrder[i,b]
+
+# Constraint 3.1: Unavailable days (only applies for unavailable days)
+def unavailable_day(model,i,b):
+    if b != min(model.DAYS) and b.dayofweek in model.unavailable_days[i]:
+        return model.QtyOrder[i,b] == 0
+    else:
+        return Constraint.Skip
+
+# Constraint 3.2: Order quantity
+def order_quantity_1(model,b):
+    if b != min(model.DAYS):
+        return sum(model.QtyOrder[i,b] for i in model.ITEMS) <= model.max_order_qty * model.IsMakeOrder[b]
+    else:
+        return Constraint.Skip
+def order_quantity_2(model,b):
+    if b != min(model.DAYS):
+        return sum(model.QtyOrder[i,b] for i in model.ITEMS) >= model.min_order_qty * model.IsMakeOrder[b]
+    else:
+        return Constraint.Skip
+
+# Constraint 4: On hand inventory (only applies for the day 0)
+def onhand_inventory(model,i,b):
+    if b == min(model.DAYS):
+        return model.QtyOrder[i,b] == model.onhand_inventory[i]
+    else:
+        return Constraint.Skip
+
+# Constraint 5: QtyOrder to be integer
+def order_quantity_int(model,i,b):
+    if b != min(model.DAYS):
+        return model.QtyOrder[i,b] == model.QtyOrder_Int[i,b]
+    else:
+        return Constraint.Skip
+
+model.constraint_unfulfilled_quantity = Constraint(model.ITEMS, model.DAYS, rule=unfulfilled_quantity)
+model.constraint_wastage = Constraint(model.ITEMS, model.DAYS, rule=wastage)
+model.constraint_unavailable_day = Constraint(model.ITEMS, model.DAYS, rule=unavailable_day)
+model.constraint_order_quantity_1 = Constraint(model.DAYS, rule=order_quantity_1)
+model.constraint_order_quantity_2 = Constraint(model.DAYS, rule=order_quantity_2)
+model.constraint_onhand_inventory = Constraint(model.ITEMS, model.DAYS, rule=onhand_inventory)
+model.constraint_order_quantity_int = Constraint(model.ITEMS, model.DAYS, rule=order_quantity_int)
+
+# Execute solver -----------------------------------------------------------
+
+instance = model.create_instance(data)
+instance.write(filename ="test.mps", io_options = {"symbolic_solver_labels":True})
